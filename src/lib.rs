@@ -142,6 +142,9 @@ pub use solvers::scip::scip as default_solver;
     feature = "lpsolve",
     feature = "highs",
     feature = "scip",
+    feature = "cplex-rs",
+    feature = "clarabel",
+    feature = "lp-solvers",
 )))]
 #[cfg(feature = "cp_sat")]
 /// When the "cp_sat" cargo feature is present, cp_sat is used as the default solver

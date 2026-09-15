@@ -216,7 +216,10 @@ trait, which allows you to access the dual values of the constraints (the shadow
 [CP-SAT](https://developers.google.com/optimization/cp/cp_solver) is Google's fast constraint programming solver,
 part of [OR-Tools](https://developers.google.com/optimization). It is one of the fastest open-source solvers
 for combinatorial (integer) optimization problems, supporting both integer and boolean variables.
-CP-SAT does **not** support continuous (floating-point) variables; using a non-integer variable will cause a panic.
+CP-SAT does **not** support continuous (floating-point) variables; using one returns an error from `solve()`.
+Coefficients and constants must be finite integers. Bounds must be finite, but fractional bounds are
+supported: lower bounds are rounded up and upper bounds are rounded down, preserving the exact domain
+of an integer variable.
 
 good_lp uses the [cp_sat crate](https://crates.io/crates/cp_sat) to call the OR-Tools CP-SAT solver
 through its C++ API.

@@ -5,8 +5,9 @@
 //! - CP-SAT only supports **integer** and **binary** variables. Continuous (floating-point)
 //!   variables cause an error at solve time.
 //! - All coefficients and constants must be integers. Non-integer values cause an error
-//!   at solve time, because CP-SAT uses integer-only arithmetic. Users should round or
-//!   scale their coefficients on their own side.
+//!   at solve time, because CP-SAT uses integer-only arithmetic. Users should scale their
+//!   coefficients on their own side. Fractional bounds on integer variables are converted
+//!   exactly by rounding lower bounds up and upper bounds down.
 
 use cp_sat::builder::{CpModelBuilder, IntVar, LinearExpr};
 use cp_sat::ffi;
@@ -29,7 +30,8 @@ use crate::{
 /// - Any variable is not an integer variable (i.e., `is_integer` is `false` on the variable definition),
 ///   because CP-SAT does not support continuous variables.
 /// - Any variable has invalid bounds where the lower bound exceeds the upper bound.
-/// - Any coefficient or constant is `NaN` or not an integer (CP-SAT only accepts integer arithmetic).
+/// - Any coefficient or constant is non-finite or not an integer (CP-SAT only accepts integer arithmetic).
+/// - Any variable bound is non-finite or outside the range supported by CP-SAT.
 pub fn cp_sat(to_solve: UnsolvedProblem) -> CpSatProblem {
     let UnsolvedProblem {
         objective,
@@ -65,7 +67,7 @@ pub fn cp_sat(to_solve: UnsolvedProblem) -> CpSatProblem {
         }
     }
 
-    // Phase 2: Build the objective expression, checking for NaN coefficients.
+    // Phase 2: Build the objective expression, checking all coefficients and its constant.
     let mut objective_expr = LinearExpr::default();
     for (var, coeff) in &objective.linear.coefficients {
         match verify_integer(*coeff) {
@@ -77,6 +79,10 @@ pub fn cp_sat(to_solve: UnsolvedProblem) -> CpSatProblem {
                 return CpSatProblem::invalid(e, solver_params);
             }
         }
+    }
+    match verify_integer(objective.constant) {
+        Ok(constant) => objective_expr += constant,
+        Err(e) => return CpSatProblem::invalid(e, solver_params),
     }
 
     // Set objective direction
@@ -134,6 +140,20 @@ fn verify_integer(x: f64) -> Result<i64, ResolutionError> {
     Ok(x as i64)
 }
 
+/// Converts a finite good_lp bound to the exact bound of an integer domain.
+///
+/// For integer variables, `x >= lower` is equivalent to `x >= ceil(lower)` and
+/// `x <= upper` is equivalent to `x <= floor(upper)`.
+fn integer_bound(x: f64, is_lower: bool) -> Result<i64, ResolutionError> {
+    if !x.is_finite() {
+        return Err(ResolutionError::Str(format!(
+            "The CP-SAT solver requires finite variable bounds. \
+             Received `{x}`, which is not finite."
+        )));
+    }
+    verify_integer(if is_lower { x.ceil() } else { x.floor() })
+}
+
 /// Builds a `LinearExpr` from a good_lp `Constraint`'s expression,
 /// converting f64 coefficients to i64.
 fn expr_from_constraint_expression(
@@ -163,7 +183,8 @@ fn validate_gap(gap: f64) -> Result<(), MipGapError> {
 
 /// Translates a good_lp `VariableDefinition` into a CP-SAT `IntVar`.
 ///
-/// All bounds are validated through [`verify_integer`] — they must be finite integers.
+/// Bounds must be finite and are converted to the exact integer domain by rounding
+/// the lower bound up and the upper bound down.
 ///
 /// Returns an error if the lower bound exceeds the upper bound.
 fn create_cp_sat_var(
@@ -171,9 +192,8 @@ fn create_cp_sat_var(
     def: &VariableDefinition,
     _var: Variable,
 ) -> Result<IntVar, ResolutionError> {
-    // Translate bounds to CP-SAT domain via verify_integer (rejects non-finite, non-integer values)
-    let domain_lower = verify_integer(def.min)?;
-    let domain_upper = verify_integer(def.max)?;
+    let domain_lower = integer_bound(def.min, true)?;
+    let domain_upper = integer_bound(def.max, false)?;
 
     // Validate: lower bound must not exceed upper bound
     if domain_lower > domain_upper {
@@ -363,6 +383,38 @@ impl CpSatProblem {
     }
 }
 
+fn gap_limit_reached(response: &CpSolverResponse, params: &SatParameters) -> bool {
+    let absolute_gap = (response.objective_value - response.best_objective_bound).abs();
+    if absolute_gap == 0.0 {
+        return false;
+    }
+
+    params
+        .absolute_gap_limit
+        .is_some_and(|limit| absolute_gap <= limit)
+        || params
+            .relative_gap_limit
+            .is_some_and(|limit| absolute_gap / response.objective_value.abs().max(1.0) <= limit)
+}
+
+fn non_optimal_solution_status(
+    response: &CpSolverResponse,
+    params: &SatParameters,
+) -> Result<SolutionStatus, ResolutionError> {
+    if gap_limit_reached(response, params) {
+        return Ok(SolutionStatus::GapLimit);
+    }
+    if params.max_deterministic_time.is_some() || params.max_time_in_seconds.is_some() {
+        return Ok(SolutionStatus::TimeLimit);
+    }
+
+    Err(ResolutionError::Str(format!(
+        "CP-SAT returned a feasible solution without proving optimality, but good_lp cannot \
+         represent its stopping reason as a SolutionStatus. CP-SAT solution info: {}",
+        response.solution_info
+    )))
+}
+
 impl SolverModel for CpSatProblem {
     type Solution = CpSatSolution;
     type Error = ResolutionError;
@@ -375,34 +427,33 @@ impl SolverModel for CpSatProblem {
 
                 let has_time_limit = self.solver_params.max_deterministic_time.is_some()
                     || self.solver_params.max_time_in_seconds.is_some();
-                let has_gap_limit = self.solver_params.relative_gap_limit.is_some()
-                    || self.solver_params.absolute_gap_limit.is_some();
-
-                let status_from_limits = if has_time_limit {
-                    SolutionStatus::TimeLimit
-                } else if has_gap_limit {
-                    SolutionStatus::GapLimit
-                } else {
-                    SolutionStatus::Optimal
-                };
 
                 match response.status() {
                     CpSolverStatus::Optimal => Ok(CpSatSolution {
+                        status: if gap_limit_reached(&response, &self.solver_params) {
+                            SolutionStatus::GapLimit
+                        } else {
+                            SolutionStatus::Optimal
+                        },
                         response,
-                        status: SolutionStatus::Optimal,
                         cp_sat_vars,
                     }),
-                    CpSolverStatus::Feasible => Ok(CpSatSolution {
-                        response,
-                        status: status_from_limits,
-                        cp_sat_vars,
-                    }),
+                    CpSolverStatus::Feasible => {
+                        let status = non_optimal_solution_status(&response, &self.solver_params)?;
+                        Ok(CpSatSolution {
+                            response,
+                            status,
+                            cp_sat_vars,
+                        })
+                    }
                     CpSolverStatus::Infeasible => Err(ResolutionError::Infeasible),
                     CpSolverStatus::Unknown => {
                         if !response.solution.is_empty() {
+                            let status =
+                                non_optimal_solution_status(&response, &self.solver_params)?;
                             Ok(CpSatSolution {
                                 response,
-                                status: status_from_limits,
+                                status,
                                 cp_sat_vars,
                             })
                         } else if has_time_limit {
@@ -597,7 +648,9 @@ impl Solution for CpSatSolution {
 
 #[cfg(test)]
 mod tests {
-    use super::cp_sat;
+    use super::{
+        CpSolverResponse, SatParameters, cp_sat, gap_limit_reached, non_optimal_solution_status,
+    };
     use crate::{
         Solution, SolverModel, WithInitialSolution, constraint,
         solvers::{SolutionStatus, WithTimeLimit},
@@ -840,9 +893,27 @@ mod tests {
     }
 
     #[test]
-    fn test_non_integer_bound_returns_error() {
+    fn fractional_bounds_preserve_the_integer_domain() {
         let mut vars = variables!();
-        let x = vars.add(variable().integer().min(2.5).max(10)); // non-integer lower bound
+        let x = vars.add(variable().integer().min(1.5).max(4.5));
+        let solution = vars.maximise(x).using(cp_sat).solve().unwrap();
+
+        assert_eq!(solution.value(x), 4.0);
+    }
+
+    #[test]
+    fn fractional_bounds_with_no_integer_between_them_return_error() {
+        let mut vars = variables!();
+        let x = vars.add(variable().integer().min(2.1).max(2.9));
+        let result = vars.maximise(x).using(cp_sat).solve();
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_non_finite_bound_returns_error() {
+        let mut vars = variables!();
+        let x = vars.add(variable().integer().min(f64::NAN).max(10));
         let pb = vars.maximise(x).using(cp_sat);
         let result = pb.solve();
         assert!(result.is_err());
@@ -850,8 +921,8 @@ mod tests {
         match &err {
             crate::ResolutionError::Str(msg) => {
                 assert!(
-                    msg.contains("not an integer"),
-                    "Error message should mention non-integer, got: {msg}"
+                    msg.contains("requires finite variable bounds"),
+                    "Error message should mention non-finite bounds, got: {msg}"
                 );
             }
             other => panic!("Expected ResolutionError::Str, got: {other:?}"),
@@ -869,7 +940,7 @@ mod tests {
         match &err {
             crate::ResolutionError::Str(msg) => {
                 assert!(
-                    msg.contains("does not accept infinite values"),
+                    msg.contains("requires finite variable bounds"),
                     "Error message should mention infinite values, got: {msg}"
                 );
             }
@@ -1108,6 +1179,49 @@ mod tests {
 
         let sol = pb.solve().unwrap();
         assert_eq!(sol.value(x), 10.0);
+    }
+
+    #[test]
+    fn detects_a_gap_limit_reported_as_optimal_by_cp_sat() {
+        let response = CpSolverResponse {
+            objective_value: 100.0,
+            best_objective_bound: 110.0,
+            ..CpSolverResponse::default()
+        };
+        let params = SatParameters {
+            relative_gap_limit: Some(0.1),
+            ..SatParameters::default()
+        };
+
+        assert!(gap_limit_reached(&response, &params));
+    }
+
+    #[test]
+    fn feasible_without_a_supported_stopping_reason_is_not_optimal() {
+        let response = CpSolverResponse {
+            solution_info: "stopped after first solution".to_owned(),
+            ..CpSolverResponse::default()
+        };
+
+        assert!(non_optimal_solution_status(&response, &SatParameters::default()).is_err());
+    }
+
+    #[test]
+    fn objective_constant_is_forwarded_to_cp_sat() {
+        let mut vars = variables!();
+        let x = vars.add(variable().integer().min(0).max(10));
+        let solution = vars.maximise(x + 100).using(cp_sat).solve().unwrap();
+
+        assert_eq!(solution.response().objective_value, 110.0);
+    }
+
+    #[test]
+    fn fractional_objective_constant_returns_error() {
+        let mut vars = variables!();
+        let x = vars.add(variable().integer().min(0).max(10));
+        let result = vars.maximise(x + 0.5).using(cp_sat).solve();
+
+        assert!(result.is_err());
     }
 
     #[test]
