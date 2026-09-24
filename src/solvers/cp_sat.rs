@@ -509,7 +509,7 @@ impl SolverModel for CpSatProblem {
                         }
                     };
 
-                if constraint.is_equality {
+                if constraint.is_equality() {
                     model.add_eq(linear_expr, constant_i64);
                 } else {
                     model.add_le(linear_expr, constant_i64);
